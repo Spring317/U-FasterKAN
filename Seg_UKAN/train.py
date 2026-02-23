@@ -24,7 +24,7 @@ from albumentations import RandomRotate90, Resize
 import archs
 
 import losses
-from dataset import Dataset
+from dataset import BDD100KDataset, BDD100K_NUM_CLASSES
 
 from metrics import iou_score, indicators
 
@@ -35,6 +35,8 @@ from tensorboardX import SummaryWriter
 import shutil
 import os
 import subprocess
+import mlflow
+import mlflow.pytorch
 
 from pdb import set_trace as st
 
@@ -127,7 +129,10 @@ def parse_args():
     parser.add_argument('--num_workers', default=4, type=int)
 
     parser.add_argument('--no_kan', action='store_true')
-
+    
+    # Resume training
+    parser.add_argument('--resume', default=False, type=str2bool,
+                        help='resume from checkpoint: best model')
 
 
     config = parser.parse_args()
@@ -255,6 +260,11 @@ def main():
             config['name'] = '%s_%s_woDS' % (config['dataset'], config['arch'])
     
     os.makedirs(f'{output_dir}/{exp_name}', exist_ok=True)
+    
+    # Setup MLflow
+    mlflow.set_tracking_uri(f'file://{os.path.abspath(output_dir)}/mlruns')
+    mlflow.set_experiment(config['dataset'])
+    mlflow_run = mlflow.start_run(run_name=exp_name)
 
     print('-' * 20)
     for key in config:
@@ -263,6 +273,23 @@ def main():
 
     with open(f'{output_dir}/{exp_name}/config.yml', 'w') as f:
         yaml.dump(config, f)
+    
+    # Log parameters to MLflow
+    mlflow.log_params({
+        'arch': config['arch'],
+        'num_classes': config['num_classes'],
+        'input_h': config['input_h'],
+        'input_w': config['input_w'],
+        'batch_size': config['batch_size'],
+        'epochs': config['epochs'],
+        'lr': config['lr'],
+        'optimizer': config['optimizer'],
+        'scheduler': config['scheduler'],
+        'loss': config['loss'],
+        'deep_supervision': config['deep_supervision'],
+        'no_kan': config['no_kan'],
+        'dataset': config['dataset'],
+    })
 
     # define loss function (criterion)
     if config['loss'] == 'BCEWithLogitsLoss':
@@ -319,21 +346,46 @@ def main():
     shutil.copy2('train.py', f'{output_dir}/{exp_name}/')
     shutil.copy2('archs.py', f'{output_dir}/{exp_name}/')
 
-    dataset_name = config['dataset']
-    img_ext = '.png'
-
-    if dataset_name == 'busi':
-        mask_ext = '_mask.png'
-    elif dataset_name == 'glas':
-        mask_ext = '.png'
-    elif dataset_name == 'cvc':
-        mask_ext = '.png'
-
-    # Data loading code
-    img_ids = sorted(glob(os.path.join(config['data_dir'], config['dataset'], 'images', '*' + img_ext)))
-    img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]
-
-    train_img_ids, val_img_ids = train_test_split(img_ids, test_size=0.2, random_state=config['dataseed'])
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    best_iou = 0
+    best_dice = 0
+    
+    if config['resume']:
+        # Try checkpoint_best.pth first (full checkpoint), then model.pth (state_dict only)
+        checkpoint_best_path = f'{output_dir}/{exp_name}/checkpoint_best.pth'
+        model_path = f'{output_dir}/{exp_name}/model.pth'
+        
+        if os.path.exists(checkpoint_best_path):
+            # Full checkpoint with optimizer/scheduler state
+            print(f"=> Loading full checkpoint from {checkpoint_best_path}")
+            checkpoint = torch.load(checkpoint_best_path)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if scheduler is not None and checkpoint.get('scheduler_state_dict') is not None:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_iou = checkpoint['best_iou']
+            best_dice = checkpoint['best_dice']
+            print(f"=> Resumed from epoch {checkpoint['epoch']}, best_iou: {best_iou:.4f}, best_dice: {best_dice:.4f}")
+        elif os.path.exists(model_path):
+            # model.pth only contains state_dict (no optimizer/scheduler state)
+            print(f"=> Loading model weights from {model_path} (state_dict only)")
+            state_dict = torch.load(model_path)
+            model.load_state_dict(state_dict)
+            # Cannot resume optimizer/scheduler, will start fresh
+            # Try to get last epoch from log.csv
+            log_path = f'{output_dir}/{exp_name}/log.csv'
+            if os.path.exists(log_path):
+                existing_log = pd.read_csv(log_path)
+                if len(existing_log) > 0:
+                    start_epoch = int(existing_log['epoch'].iloc[-1]) + 1
+                    best_iou = float(existing_log['val_iou'].max())
+                    best_dice = float(existing_log.loc[existing_log['val_iou'].idxmax(), 'val_dice'])
+            print(f"=> Loaded model weights, resuming from epoch {start_epoch}, best_iou: {best_iou:.4f}")
+            print("=> Note: Optimizer and scheduler states not restored (using model.pth)")
+        else:
+            print(f"=> No checkpoint found, starting from scratch")
 
     train_transform = Compose([
         RandomRotate90(),
@@ -347,22 +399,51 @@ def main():
         transforms.Normalize(),
     ])
 
-    train_dataset = Dataset(
+    # BDD100K dataset paths
+    bdd100k_base = '/media/gamedisk/M2_internship/bdd100k_seg/bdd100k/seg'
+    
+    # Get image IDs from the BDD100K training set - use masks as the source of truth
+    # Mask files have _train_id suffix (e.g., 76fb546e-d86c57a0_train_id.png)
+    # but images don't (e.g., 76fb546e-d86c57a0.jpg)
+    train_mask_paths = sorted(glob(os.path.join(bdd100k_base, 'labels', 'train', '*.png')))
+    train_img_ids = []
+    for p in train_mask_paths:
+        mask_name = os.path.splitext(os.path.basename(p))[0]
+        # Remove _train_id suffix if present
+        img_id = mask_name.replace('_train_id', '')
+        train_img_ids.append(img_id)
+    
+    # Get image IDs from the BDD100K validation set - use masks as the source of truth
+    val_mask_paths = sorted(glob(os.path.join(bdd100k_base, 'labels', 'val', '*.png')))
+    val_img_ids = []
+    for p in val_mask_paths:
+        mask_name = os.path.splitext(os.path.basename(p))[0]
+        # Remove _train_id suffix if present (val might have different suffix)
+        img_id = mask_name.replace('_train_id', '')
+        val_img_ids.append(img_id)
+    
+    print(f"Training samples: {len(train_img_ids)}, Validation samples: {len(val_img_ids)}")
+    
+    train_dataset = BDD100KDataset(
         img_ids=train_img_ids,
-        img_dir=os.path.join(config['data_dir'], config['dataset'], 'images'),
-        mask_dir=os.path.join(config['data_dir'], config['dataset'], 'masks'),
-        img_ext=img_ext,
-        mask_ext=mask_ext,
-        num_classes=config['num_classes'],
-        transform=train_transform)
-    val_dataset = Dataset(
+        img_dir=os.path.join(bdd100k_base, 'images', 'train'),
+        mask_dir=os.path.join(bdd100k_base, 'labels', 'train'),
+        img_ext='.jpg',
+        mask_ext='.png',
+        num_classes=BDD100K_NUM_CLASSES,
+        transform=train_transform,
+        mask_suffix='_train_id'
+    )
+    val_dataset = BDD100KDataset(
         img_ids=val_img_ids,
-        img_dir=os.path.join(config['data_dir'] ,config['dataset'], 'images'),
-        mask_dir=os.path.join(config['data_dir'], config['dataset'], 'masks'),
-        img_ext=img_ext,
-        mask_ext=mask_ext,
-        num_classes=config['num_classes'],
-        transform=val_transform)
+        img_dir=os.path.join(bdd100k_base, 'images', 'val'),
+        mask_dir=os.path.join(bdd100k_base, 'labels', 'val'),
+        img_ext='.jpg',
+        mask_ext='.png',
+        num_classes=BDD100K_NUM_CLASSES,
+        transform=val_transform,
+        mask_suffix='_train_id'
+    )
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -386,12 +467,17 @@ def main():
         ('val_iou', []),
         ('val_dice', []),
     ])
+    
+    # Load existing log if resuming
+    log_path = f'{output_dir}/{exp_name}/log.csv'
+    if config['resume'] and os.path.exists(log_path):
+        existing_log = pd.read_csv(log_path)
+        for key in log.keys():
+            log[key] = existing_log[key].tolist()[:start_epoch]
+        print(f"=> Loaded existing log with {len(log['epoch'])} entries")
 
-
-    best_iou = 0
-    best_dice= 0
     trigger = 0
-    for epoch in range(config['epochs']):
+    for epoch in range(start_epoch, config['epochs']):
         print('Epoch [%d/%d]' % (epoch, config['epochs']))
 
         # train for one epoch
@@ -425,13 +511,49 @@ def main():
 
         my_writer.add_scalar('val/best_iou_value', best_iou, global_step=epoch)
         my_writer.add_scalar('val/best_dice_value', best_dice, global_step=epoch)
+        
+        # Log metrics to MLflow
+        mlflow.log_metrics({
+            'train_loss': train_log['loss'],
+            'train_iou': train_log['iou'],
+            'val_loss': val_log['loss'],
+            'val_iou': val_log['iou'],
+            'val_dice': val_log['dice'],
+            'best_iou': best_iou,
+            'best_dice': best_dice,
+        }, step=epoch)
 
         trigger += 1
+        
+        # Save last checkpoint (every epoch)
+        checkpoint_last = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+            'best_iou': best_iou,
+            'best_dice': best_dice,
+            'config': config,
+        }
+        torch.save(checkpoint_last, f'{output_dir}/{exp_name}/checkpoint_last.pth')
 
         if val_log['iou'] > best_iou:
-            torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model.pth')
+            torch.save(model.state_dict(), f'{output_dir}/{exp_name}/model_best.pth')
             best_iou = val_log['iou']
             best_dice = val_log['dice']
+            
+            # Save best checkpoint
+            checkpoint_best = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                'best_iou': best_iou,
+                'best_dice': best_dice,
+                'config': config,
+            }
+            torch.save(checkpoint_best, f'{output_dir}/{exp_name}/checkpoint_best.pth')
+            
             print("=> saved best model")
             print('IoU: %.4f' % best_iou)
             print('Dice: %.4f' % best_dice)
@@ -443,6 +565,21 @@ def main():
             break
 
         torch.cuda.empty_cache()
+    
+    # Log final model and artifacts to MLflow
+    mlflow.log_artifact(f'{output_dir}/{exp_name}/config.yml')
+    mlflow.log_artifact(f'{output_dir}/{exp_name}/log.csv')
+    mlflow.log_artifact(f'{output_dir}/{exp_name}/model.pth')
+    mlflow.pytorch.log_model(model, 'model')
+    
+    # Log final metrics
+    mlflow.log_metrics({
+        'final_best_iou': best_iou,
+        'final_best_dice': best_dice,
+    })
+    
+    mlflow.end_run()
+    print(f"MLflow run completed. View at: {mlflow.get_tracking_uri()}")
     
 if __name__ == '__main__':
     main()

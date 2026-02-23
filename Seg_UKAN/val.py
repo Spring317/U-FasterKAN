@@ -4,6 +4,7 @@ import os
 from glob import glob
 import random
 import numpy as np
+import matplotlib.pyplot as plt
 
 import cv2
 import torch
@@ -17,7 +18,7 @@ from collections import OrderedDict
 
 import archs
 
-from dataset import Dataset
+from dataset import BDD100KDataset, BDD100K_NUM_CLASSES, BDD100K_COLOR_DICT, BDD100K_CLASSES, colorize_mask, onehot_to_mask
 from metrics import iou_score
 from utils import AverageMeter
 from albumentations import RandomRotate90,Resize
@@ -28,8 +29,9 @@ from PIL import Image
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--name', default=None, help='model name')
+    parser.add_argument('--name', default='bdd100k_UKAN', help='model name')
     parser.add_argument('--output_dir', default='outputs', help='ouput dir')
+    parser.add_argument('--num_vis', default=10, type=int, help='number of images to visualize')
             
     args = parser.parse_args()
 
@@ -46,6 +48,65 @@ def seed_torch(seed=1029):
     torch.backends.cudnn.deterministic = True
 
 
+def plot_results(images, gt_masks, pred_masks, img_ids, save_dir, num_vis=10):
+    """
+    Plot and save visualization of original image, ground truth mask, and predicted mask.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    num_images = min(num_vis, len(images))
+    
+    for idx in range(num_images):
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        # Original image
+        img = images[idx]
+        axes[0].imshow(img)
+        axes[0].set_title('Original Image')
+        axes[0].axis('off')
+        
+        # Ground truth mask (colorized)
+        gt_colored = colorize_mask(gt_masks[idx])
+        axes[1].imshow(gt_colored)
+        axes[1].set_title('Ground Truth')
+        axes[1].axis('off')
+        
+        # Predicted mask (colorized)
+        pred_colored = colorize_mask(pred_masks[idx])
+        axes[2].imshow(pred_colored)
+        axes[2].set_title('Prediction')
+        axes[2].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f'{img_ids[idx]}_comparison.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    print(f"Saved {num_images} visualization images to {save_dir}")
+
+
+def plot_class_legend(save_dir):
+    """Plot and save a legend showing all classes and their colors."""
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Create color patches for legend
+    for class_id, class_name in BDD100K_CLASSES.items():
+        color = BDD100K_COLOR_DICT[class_id]
+        ax.barh(class_id, 1, color=color, edgecolor='black', linewidth=0.5)
+        ax.text(1.1, class_id, f'{class_id}: {class_name}', va='center', fontsize=10)
+    
+    ax.set_xlim(0, 3)
+    ax.set_ylim(-0.5, 19.5)
+    ax.set_yticks([])
+    ax.set_xticks([])
+    ax.set_title('BDD100K Segmentation Classes', fontsize=14)
+    ax.invert_yaxis()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'class_legend.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved class legend to {save_dir}/class_legend.png")
+
+
 def main():
     seed_torch()
     args = parse_args()
@@ -60,28 +121,29 @@ def main():
 
     cudnn.benchmark = True
 
-    model = archs.__dict__[config['arch']](config['num_classes'], config['input_channels'], config['deep_supervision'], embed_dims=config['input_list'])
+    # Create model with no_kan flag if present in config
+    no_kan = config.get('no_kan', False)
+    model = archs.__dict__[config['arch']](config['num_classes'], config['input_channels'], config['deep_supervision'], embed_dims=config['input_list'], no_kan=no_kan)
 
     model = model.cuda()
 
-    dataset_name = config['dataset']
-    img_ext = '.png'
+    # BDD100K dataset paths
+    bdd100k_base = '/media/gamedisk/M2_internship/bdd100k_seg/bdd100k/seg'
+    
+    # Get image IDs from the BDD100K validation set - use masks as the source of truth
+    val_mask_paths = sorted(glob(os.path.join(bdd100k_base, 'labels', 'val', '*.png')))
+    val_img_ids = []
+    for p in val_mask_paths:
+        mask_name = os.path.splitext(os.path.basename(p))[0]
+        img_id = mask_name.replace('_train_id', '')
+        val_img_ids.append(img_id)
+    
+    print(f"Validation samples: {len(val_img_ids)}")
 
-    if dataset_name == 'busi':
-        mask_ext = '_mask.png'
-    elif dataset_name == 'glas':
-        mask_ext = '.png'
-    elif dataset_name == 'cvc':
-        mask_ext = '.png'
-
-    # Data loading code
-    img_ids = sorted(glob(os.path.join(config['data_dir'], config['dataset'], 'images', '*' + img_ext)))
-    # img_ids.sort()
-    img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]
-
-    _, val_img_ids = train_test_split(img_ids, test_size=0.2, random_state=config['dataseed'])
-
-    ckpt = torch.load(f'{args.output_dir}/{args.name}/model.pth')
+    # Load model weights
+    model_path = f'{args.output_dir}/{args.name}/model.pth'
+    print(f"Loading model from {model_path}")
+    ckpt = torch.load(model_path)
 
     try:        
         model.load_state_dict(ckpt)
@@ -106,14 +168,16 @@ def main():
         transforms.Normalize(),
     ])
 
-    val_dataset = Dataset(
+    val_dataset = BDD100KDataset(
         img_ids=val_img_ids,
-        img_dir=os.path.join(config['data_dir'], config['dataset'], 'images'),
-        mask_dir=os.path.join(config['data_dir'], config['dataset'], 'masks'),
-        img_ext=img_ext,
-        mask_ext=mask_ext,
-        num_classes=config['num_classes'],
-        transform=val_transform)
+        img_dir=os.path.join(bdd100k_base, 'images', 'val'),
+        mask_dir=os.path.join(bdd100k_base, 'labels', 'val'),
+        img_ext='.jpg',
+        mask_ext='.png',
+        num_classes=BDD100K_NUM_CLASSES,
+        transform=val_transform,
+        mask_suffix='_train_id'
+    )
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=config['batch_size'],
@@ -123,38 +187,114 @@ def main():
 
     iou_avg_meter = AverageMeter()
     dice_avg_meter = AverageMeter()
-    hd95_avg_meter = AverageMeter()
+    
+    # Per-class IoU tracking
+    class_iou_sum = np.zeros(BDD100K_NUM_CLASSES)
+    class_iou_count = np.zeros(BDD100K_NUM_CLASSES)
+
+    # Store images for visualization
+    vis_images = []
+    vis_gt_masks = []
+    vis_pred_masks = []
+    vis_img_ids = []
+
+    output_dir = os.path.join(args.output_dir, config['name'], 'out_val')
+    os.makedirs(output_dir, exist_ok=True)
 
     with torch.no_grad():
         for input, target, meta in tqdm(val_loader, total=len(val_loader)):
             input = input.cuda()
             target = target.cuda()
             model = model.cuda()
+            
             # compute output
             output = model(input)
 
-            iou, dice, hd95_ = iou_score(output, target)
+            iou, dice, _ = iou_score(output, target)
             iou_avg_meter.update(iou, input.size(0))
             dice_avg_meter.update(dice, input.size(0))
-            hd95_avg_meter.update(hd95_, input.size(0))
 
-            output = torch.sigmoid(output).cpu().numpy()
-            output[output>=0.5]=1
-            output[output<0.5]=0
+            # Get predictions (argmax over channels)
+            output_sigmoid = torch.sigmoid(output)
+            pred_masks = torch.argmax(output_sigmoid, dim=1).cpu().numpy()  # (B, H, W)
+            
+            # Get ground truth masks (argmax over one-hot)
+            gt_masks = torch.argmax(target, dim=1).cpu().numpy()  # (B, H, W)
+            
+            # Get original images for visualization (denormalize)
+            input_np = input.cpu().numpy()
+            
+            # Save predictions and collect for visualization
+            for i, (pred, gt, img_id) in enumerate(zip(pred_masks, gt_masks, meta['img_id'])):
+                # Save prediction as colored mask
+                pred_colored = colorize_mask(pred)
+                cv2.imwrite(os.path.join(output_dir, f'{img_id}_pred.png'), cv2.cvtColor(pred_colored, cv2.COLOR_RGB2BGR))
+                
+                # Save prediction as class indices
+                cv2.imwrite(os.path.join(output_dir, f'{img_id}_pred_class.png'), pred.astype(np.uint8))
+                
+                # Collect for visualization (only first num_vis samples)
+                if len(vis_images) < args.num_vis:
+                    # Denormalize image for visualization
+                    img = input_np[i].transpose(1, 2, 0)  # (H, W, C)
+                    img = img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+                    img = np.clip(img, 0, 1)
+                    
+                    vis_images.append(img)
+                    vis_gt_masks.append(gt)
+                    vis_pred_masks.append(pred)
+                    vis_img_ids.append(img_id)
 
-            os.makedirs(os.path.join(args.output_dir, config['name'], 'out_val'), exist_ok=True)
-            for pred, img_id in zip(output, meta['img_id']):
-                pred_np = pred[0].astype(np.uint8)
-                pred_np = pred_np * 255
-                img = Image.fromarray(pred_np, 'L')
-                img.save(os.path.join(args.output_dir, config['name'], 'out_val/{}.jpg'.format(img_id)))
-
+    # Print overall metrics
+    print('\n' + '='*50)
+    print(f'Model: {config["name"]}')
+    print('='*50)
+    print(f'Overall IoU: {iou_avg_meter.avg:.4f}')
+    print(f'Overall Dice: {dice_avg_meter.avg:.4f}')
+    print('='*50)
     
-    print(config['name'])
-    print('IoU: %.4f' % iou_avg_meter.avg)
-    print('Dice: %.4f' % dice_avg_meter.avg)
-    print('HD95: %.4f' % hd95_avg_meter.avg)
-
+    # Plot visualization results
+    vis_dir = os.path.join(args.output_dir, config['name'], 'visualizations')
+    plot_results(vis_images, vis_gt_masks, vis_pred_masks, vis_img_ids, vis_dir, args.num_vis)
+    
+    # Plot class legend
+    plot_class_legend(vis_dir)
+    
+    # Create a summary plot with multiple samples
+    num_summary = min(6, len(vis_images))
+    fig, axes = plt.subplots(num_summary, 3, figsize=(15, 5 * num_summary))
+    
+    for idx in range(num_summary):
+        # Original image
+        axes[idx, 0].imshow(vis_images[idx])
+        axes[idx, 0].set_title(f'Image: {vis_img_ids[idx]}' if idx == 0 else '')
+        axes[idx, 0].axis('off')
+        
+        # Ground truth
+        gt_colored = colorize_mask(vis_gt_masks[idx])
+        axes[idx, 1].imshow(gt_colored)
+        axes[idx, 1].set_title('Ground Truth' if idx == 0 else '')
+        axes[idx, 1].axis('off')
+        
+        # Prediction
+        pred_colored = colorize_mask(vis_pred_masks[idx])
+        axes[idx, 2].imshow(pred_colored)
+        axes[idx, 2].set_title('Prediction' if idx == 0 else '')
+        axes[idx, 2].axis('off')
+    
+    plt.suptitle(f'BDD100K Validation Results - IoU: {iou_avg_meter.avg:.4f}, Dice: {dice_avg_meter.avg:.4f}', fontsize=14)
+    plt.tight_layout()
+    plt.savefig(os.path.join(vis_dir, 'summary_results.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved summary plot to {vis_dir}/summary_results.png")
+    
+    # Save metrics to file
+    metrics_path = os.path.join(args.output_dir, config['name'], 'val_metrics.txt')
+    with open(metrics_path, 'w') as f:
+        f.write(f"Model: {config['name']}\n")
+        f.write(f"Overall IoU: {iou_avg_meter.avg:.4f}\n")
+        f.write(f"Overall Dice: {dice_avg_meter.avg:.4f}\n")
+    print(f"Saved metrics to {metrics_path}")
 
 
 if __name__ == '__main__':
