@@ -35,8 +35,6 @@ from tensorboardX import SummaryWriter
 import shutil
 import os
 import subprocess
-import mlflow
-import mlflow.pytorch
 
 from pdb import set_trace as st
 
@@ -260,11 +258,6 @@ def main():
             config['name'] = '%s_%s_woDS' % (config['dataset'], config['arch'])
     
     os.makedirs(f'{output_dir}/{exp_name}', exist_ok=True)
-    
-    # Setup MLflow
-    mlflow.set_tracking_uri(f'file://{os.path.abspath(output_dir)}/mlruns')
-    mlflow.set_experiment(config['dataset'])
-    mlflow_run = mlflow.start_run(run_name=exp_name)
 
     print('-' * 20)
     for key in config:
@@ -273,23 +266,6 @@ def main():
 
     with open(f'{output_dir}/{exp_name}/config.yml', 'w') as f:
         yaml.dump(config, f)
-    
-    # Log parameters to MLflow
-    mlflow.log_params({
-        'arch': config['arch'],
-        'num_classes': config['num_classes'],
-        'input_h': config['input_h'],
-        'input_w': config['input_w'],
-        'batch_size': config['batch_size'],
-        'epochs': config['epochs'],
-        'lr': config['lr'],
-        'optimizer': config['optimizer'],
-        'scheduler': config['scheduler'],
-        'loss': config['loss'],
-        'deep_supervision': config['deep_supervision'],
-        'no_kan': config['no_kan'],
-        'dataset': config['dataset'],
-    })
 
     # define loss function (criterion)
     if config['loss'] == 'BCEWithLogitsLoss':
@@ -312,12 +288,6 @@ def main():
     print(f'Trainable parameters: {trainable_params:,}')
     print(f'Non-trainable parameters: {total_params - trainable_params:,}')
     print('-' * 20)
-
-    # Log model parameters to MLflow
-    mlflow.log_params({
-        'total_params': total_params,
-        'trainable_params': trainable_params,
-    })
 
     param_groups = []
 
@@ -525,17 +495,6 @@ def main():
 
         my_writer.add_scalar('val/best_iou_value', best_iou, global_step=epoch)
         my_writer.add_scalar('val/best_dice_value', best_dice, global_step=epoch)
-        
-        # Log metrics to MLflow
-        mlflow.log_metrics({
-            'train_loss': train_log['loss'],
-            'train_iou': train_log['iou'],
-            'val_loss': val_log['loss'],
-            'val_iou': val_log['iou'],
-            'val_dice': val_log['dice'],
-            'best_iou': best_iou,
-            'best_dice': best_dice,
-        }, step=epoch)
 
         trigger += 1
         
@@ -579,21 +538,6 @@ def main():
             break
 
         torch.cuda.empty_cache()
-    
-    # Log final model and artifacts to MLflow
-    mlflow.log_artifact(f'{output_dir}/{exp_name}/config.yml')
-    mlflow.log_artifact(f'{output_dir}/{exp_name}/log.csv')
-    mlflow.log_artifact(f'{output_dir}/{exp_name}/model.pth')
-    mlflow.pytorch.log_model(model, 'model')
-    
-    # Log final metrics
-    mlflow.log_metrics({
-        'final_best_iou': best_iou,
-        'final_best_dice': best_dice,
-    })
-    
-    mlflow.end_run()
-    print(f"MLflow run completed. View at: {mlflow.get_tracking_uri()}")
     
 if __name__ == '__main__':
     main()
