@@ -72,7 +72,7 @@ class KANLayer(nn.Module):
             )
             self.fc2 = KANLinear(
                 hidden_features,
-                out_features,
+                x,
                 grid_size=grid_size,
                 spline_order=spline_order,
                 scale_noise=scale_noise,
@@ -330,7 +330,7 @@ class UKAN(nn.Module):
         img_size=224,
         patch_size=16,
         in_chans=3,
-        embed_dims=[256, 320, 512],
+        embed_dims=[64, 128, 256],  ## Similar to original U-Net
         no_kan=False,
         drop_rate=0.0,
         drop_path_rate=0.0,

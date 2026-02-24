@@ -304,6 +304,20 @@ def main():
 
     model = model.cuda()
 
+    # Calculate and print total parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print('-' * 20)
+    print(f'Total parameters: {total_params:,}')
+    print(f'Trainable parameters: {trainable_params:,}')
+    print(f'Non-trainable parameters: {total_params - trainable_params:,}')
+    print('-' * 20)
+
+    # Log model parameters to MLflow
+    mlflow.log_params({
+        'total_params': total_params,
+        'trainable_params': trainable_params,
+    })
 
     param_groups = []
 
