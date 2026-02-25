@@ -259,6 +259,11 @@ def main():
     
     os.makedirs(f'{output_dir}/{exp_name}', exist_ok=True)
 
+    # Override num_classes for BDD100K dataset
+    if config['dataset'] == 'bdd100k':
+        config['num_classes'] = BDD100K_NUM_CLASSES
+        print(f"Using BDD100K dataset with {BDD100K_NUM_CLASSES} classes")
+
     print('-' * 20)
     for key in config:
         print('%s: %s' % (key, config[key]))
